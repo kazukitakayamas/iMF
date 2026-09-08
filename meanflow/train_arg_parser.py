@@ -70,4 +70,37 @@ def get_args_parser():
     parser.add_argument("--test_run", action="store_true", help="Only run one batch of training and evaluation.")
     parser.add_argument("--not_compile", action="store_false", dest="compile", default=True, help="Disable compilation.")
 
+    # ------------------------------------------------------------------
+    # [iMF] improved MeanFlow (Geng et al., CVPR 2026)
+    # ------------------------------------------------------------------
+    parser.add_argument("--method", default="mf", type=str, choices=["mf", "imf"],
+                        help="Training objective: original MeanFlow or improved MeanFlow.")
+    parser.add_argument("--v_head", action="store_true", default=True,
+                        help="[iMF] Use the auxiliary v-head (Sec 4.1).")
+    parser.add_argument("--no_v_head", action="store_false", dest="v_head",
+                        help="[iMF] Use the boundary condition v(z,t)=u(z,t,t) instead.")
+    parser.add_argument("--use_cfg", action="store_true", default=False,
+                        help="[iMF] Flexible guidance conditioning (Sec 4.2). Requires num_classes > 0.")
+    parser.add_argument("--use_cfg_interval", action="store_true", default=False,
+                        help="[iMF] Also condition on the guidance interval (t_min, t_max).")
+    parser.add_argument("--num_classes", default=0, type=int,
+                        help="[iMF] 0 = class-unconditional. CIFAR-10 class-conditional = 10.")
+    parser.add_argument("--class_dropout_prob", default=0.1, type=float,
+                        help="[iMF] Probability of dropping the class condition.")
+    parser.add_argument("--cfg_s_max", default=3.0, type=float,
+                        help="[iMF] omega is sampled from [1, 1+s_max]. Official ImageNet value is 7.0.")
+
+    # ------------------------------------------------------------------
+    # [iMF] Single-GPU / Colab runner (iteration based; the DDP path above is epoch based)
+    # ------------------------------------------------------------------
+    parser.add_argument("--model_channels", default=128, type=int, help="U-Net base width.")
+    parser.add_argument("--total_iters", default=30_000, type=int)
+    parser.add_argument("--warmup_iters", default=1_000, type=int)
+    parser.add_argument("--grad_accum", default=1, type=int)
+    parser.add_argument("--log_every", default=100, type=int)
+    parser.add_argument("--sample_every", default=1_000, type=int)
+    parser.add_argument("--ckpt_every", default=2_000, type=int)
+    parser.add_argument("--eval_every", default=10_000, type=int)
+    parser.add_argument("--ckpt_dir", default="./ckpt", type=str)
+
     return parser
