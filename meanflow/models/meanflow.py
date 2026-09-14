@@ -82,7 +82,6 @@ class MeanFlow(nn.Module):
             if mac_w is not None:          # [MAC] Eq. 8
                 loss = loss * mac_w
 
-            loss = loss.mean()  # mean over batch dimension
 
             loss = loss.mean()  # mean over batch dimension
         
