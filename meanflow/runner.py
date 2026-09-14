@@ -19,6 +19,7 @@ from torchvision.utils import make_grid
 
 from models.augment import AugmentPipe
 from models.model_configs import instantiate_model
+from models.mac import mac_percentile                      # [MAC] 追加
 from training.data_transform import get_transform_cifar
 
 try:
@@ -180,7 +181,8 @@ class Runner:
     def train(self):
         args = self.args
         self.model.train()
-        run = {"loss": 0.0, "loss_u": 0.0, "loss_v": 0.0}
+        
+        run = {"loss": 0.0, "loss_u": 0.0, "loss_v": 0.0, "mac_err": 0.0, "mac_err_sel": 0.0}
         t0 = time.time()
 
         for step in range(self.start_step, args.total_iters):
@@ -197,15 +199,21 @@ class Runner:
                 if self.augment_pipe is not None:
                     x, aug_cond = self.augment_pipe(x)
 
+                # [MAC] 選択割合のスケジュール (公式 get_current_percentile)
+                mac_p = (mac_percentile(step, args.mac_warmup_iters, args.mac_percent)
+                         if getattr(args, "mac", False) else None)
+
                 if self.is_imf:
-                    loss, parts = self.model.forward_with_loss(x, y, aug_cond)
+                    loss, parts = self.model.forward_with_loss(x, y, aug_cond, mac_percentile=mac_p)
                 else:
-                    loss, parts = self.model.forward_with_loss(x, aug_cond), {}
+                    loss, parts = self.model.forward_with_loss(x, aug_cond, mac_percentile=mac_p), {}
 
                 (loss / args.grad_accum).backward()
                 run["loss"] += float(loss.detach()) / args.grad_accum
                 run["loss_u"] += parts.get("loss_u", 0.0) / args.grad_accum
                 run["loss_v"] += parts.get("loss_v", 0.0) / args.grad_accum
+                run["mac_err"] += parts.get("mac_err", 0.0) / args.grad_accum
+                run["mac_err_sel"] += parts.get("mac_err_sel", 0.0) / args.grad_accum
 
             self.opt.step()
             self.model.update_ema()
@@ -215,10 +223,15 @@ class Runner:
 
             if (step + 1) % args.log_every == 0:
                 dt, n = time.time() - t0, args.log_every
-                _log({"train/loss": run["loss"] / n, "train/loss_u": run["loss_u"] / n,
-                      "train/loss_v": run["loss_v"] / n,
-                      "train/lr": self.opt.param_groups[0]["lr"],
-                      "perf/sec_per_iter": dt / n}, step + 1)
+                metrics = {"train/loss": run["loss"] / n, "train/loss_u": run["loss_u"] / n,
+                           "train/loss_v": run["loss_v"] / n,
+                           "train/lr": self.opt.param_groups[0]["lr"],
+                           "perf/sec_per_iter": dt / n}
+                if getattr(args, "mac", False):                      # [MAC]
+                    metrics.update({"mac/percentile": mac_p,
+                                    "mac/endpoint_err": run["mac_err"] / n,
+                                    "mac/endpoint_err_selected": run["mac_err_sel"] / n})
+                _log(metrics, step + 1)
                 print(f"step {step+1:>7} | loss {run['loss']/n:.4f} "
                       f"(u {run['loss_u']/n:.3f} / v {run['loss_v']/n:.3f}) "
                       f"| lr {self.opt.param_groups[0]['lr']:.2e} | {dt/n:.3f} s/it")
