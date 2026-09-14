@@ -91,6 +91,21 @@ def get_args_parser():
                         help="[iMF] omega is sampled from [1, 1+s_max]. Official ImageNet value is 7.0.")
 
     # ------------------------------------------------------------------
+    # [MAC] Model-Aligned Coupling (Lin et al., CVPR Findings 2026)
+    # ------------------------------------------------------------------
+    parser.add_argument("--mac", action="store_true", default=False,
+                        help="[MAC] Reweight low-endpoint-error couplings (Algorithm 1 / Eq. 8).")
+    parser.add_argument("--mac_percent", default=0.5, type=float,
+                        help="[MAC] k: fraction of couplings selected as S_theta. Paper default 0.5.")
+    parser.add_argument("--mac_weight", default=1.0, type=float,
+                        help="[MAC] lambda: extra loss weight on S_theta. Paper default 1.0.")
+    parser.add_argument("--mac_warmup_iters", default=20_000, type=int,
+                        help="[MAC] Linearly anneal the selected fraction 1.0 -> mac_percent over this many steps "
+                             "(official main.py: 20000). Use ~0.2*total_iters for short runs; 0 disables annealing.")
+    parser.add_argument("--mac_scorer", default="ema", type=str, choices=["ema", "net"],
+                        help="[MAC] Which network scores the couplings. Official code uses the EMA model.")
+
+    # ------------------------------------------------------------------
     # [iMF] Single-GPU / Colab runner (iteration based; the DDP path above is epoch based)
     # ------------------------------------------------------------------
     parser.add_argument("--model_channels", default=128, type=int, help="U-Net base width.")
