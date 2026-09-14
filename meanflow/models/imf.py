@@ -24,6 +24,8 @@ import torch.nn as nn
 
 from models.ema import init_ema, update_ema_net
 from models.time_sampler import sample_two_timesteps
+from models.mac import endpoint_error, mac_weights, dup     # [MAC] 追加
+
 
 
 class iMF(nn.Module):
@@ -111,6 +113,7 @@ class iMF(nn.Module):
     # 学習
     # ------------------------------------------------------------------
     def forward_with_loss(self, x, y=None, aug_cond=None):
+    def forward_with_loss(self, x, y=None, aug_cond=None, mac_percentile=None):
         device = x.device
         bsz = x.shape[0]
 
@@ -149,9 +152,38 @@ class iMF(nn.Module):
                 v_c = self.v_fn(self.net, z, t, omega, y_in, aug_cond)
             v_g = v_t
 
+      
+        # ---- [MAC] 結合 (x, e) の学習しやすさを端点誤差で採点し、重みを作る ----
+        # 公式 MACWrapper.get_loss / select_low_loss_indices に対応。
+        # 採点は勾配なし・eval モード (dropout 無効) で行い、乱数を消費しないので
+        # 下の RNG 退避・復元とは干渉しない。
+        mac_w, mac_stats = None, {}
+        use_mac = getattr(self.args, "mac", False) and mac_percentile is not None
+        if use_mac:
+            scorer = self.net_ema if getattr(self.args, "mac_scorer", "ema") == "ema" else self.net
+            was_training = scorer.training
+            scorer.eval()
+            # 採点時の条件: ガイダンスなし (omega=1)。class は学習時に net が見るものと同じにする
+            # (use_cfg なら本物のラベル、そうでなければ null class)。
+            y_score = dup(y if self.args.use_cfg else y_in)   # 採点は 2B バッチで 1 回 forward
+            aug_score = dup(aug_cond)
+            err = endpoint_error(
+                lambda z_, t_: self.v_fn(scorer, z_, t_, torch.ones_like(t_), y_score, aug_score),
+                x, e,
+            )
+            scorer.train(was_training)
+            mac_w, mac_mask = mac_weights(err, mac_percentile, self.args.mac_weight)
+            mac_stats = {
+                "mac_err": float(err.mean()),
+                "mac_err_sel": float(err[mac_mask].mean()) if mac_mask.any() else 0.0,
+                "mac_frac": float(mac_mask.float().mean()),
+            }
+
+      
         # ---- 改変 1: 合成関数 V_theta = u + (t-r) * sg(du/dt) ----
         def fn(z_, t_, r_):
             return self.u_fn(self.net, z_, t_, r_, omega, t_min, t_max, y_in, aug_cond)
+            
 
         with torch.amp.autocast("cuda", enabled=False):
             # 上流 README 推奨の非 compile 手順: u は通常 forward、JVP は no_grad 下で計算する。
@@ -176,17 +208,25 @@ class iMF(nn.Module):
                 return loss / w
 
             loss_u = adaptive_weight(((V - v_g) ** 2).sum(dim=(1, 2, 3)))
-            loss = loss_u
             loss_v = torch.zeros((), device=device)
             if self.args.v_head:
                 loss_v = adaptive_weight(((v_aux - v_g) ** 2).sum(dim=(1, 2, 3)))
-                loss = loss + loss_v
 
+            # [MAC] Eq. 8: 適応重み付けの後にサンプル重み w を掛ける (公式と同じ順序)
+            if mac_w is not None:
+                loss_u = loss_u * mac_w
+                if self.args.v_head:
+                    loss_v = loss_v * mac_w
+
+            loss = loss_u
+            if self.args.v_head:
+                loss = loss + loss_v
             loss = loss.mean()
 
         return loss, {
             "loss_u": float(loss_u.mean().detach()),
             "loss_v": float(loss_v.mean().detach()),
+            **mac_stats,
         }
 
     # ------------------------------------------------------------------
