@@ -112,7 +112,6 @@ class iMF(nn.Module):
     # ------------------------------------------------------------------
     # 学習
     # ------------------------------------------------------------------
-    def forward_with_loss(self, x, y=None, aug_cond=None):
     def forward_with_loss(self, x, y=None, aug_cond=None, mac_percentile=None):
         device = x.device
         bsz = x.shape[0]
