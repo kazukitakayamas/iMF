@@ -104,6 +104,15 @@ def get_args_parser():
                              "(official main.py: 20000). Use ~0.2*total_iters for short runs; 0 disables annealing.")
     parser.add_argument("--mac_scorer", default="ema", type=str, choices=["ema", "net"],
                         help="[MAC] Which network scores the couplings. Official code uses the EMA model.")
+    parser.add_argument("--mac_timing", default="all",
+                        choices=["none", "all", "early", "middle", "late", "custom"])
+    parser.add_argument("--mac_start_fraction", default=0.0, type=float)
+    parser.add_argument("--mac_end_fraction", default=1.0, type=float)
+    parser.add_argument("--mac_target", default="both", choices=["both", "main", "aux"],
+                        help="iMF loss to reweight; main denotes the composite V loss.")
+    parser.add_argument("--mac_selection", default="model", choices=["model", "random"])
+    parser.add_argument("--mac_random_seed", default=12345, type=int)
+    parser.add_argument("--mac_normalize_weights", action="store_true", default=False)
 
     # ------------------------------------------------------------------
     # [iMF] Single-GPU / Colab runner (iteration based; the DDP path above is epoch based)
@@ -117,5 +126,11 @@ def get_args_parser():
     parser.add_argument("--ckpt_every", default=2_000, type=int)
     parser.add_argument("--eval_every", default=10_000, type=int)
     parser.add_argument("--ckpt_dir", default="./ckpt", type=str)
+    parser.add_argument("--eval_seed", default=42, type=int)
+    parser.add_argument("--eval_steps", nargs="+", type=int, default=[1, 2, 4])
+    parser.add_argument("--eval_batch_size", default=250, type=int)
+    parser.add_argument("--resume_training", action="store_true", default=False,
+                        help="Explicitly resume a matching checkpoint in the Colab Runner.")
+    parser.add_argument("--deterministic", action="store_true", default=False)
 
     return parser
