@@ -70,7 +70,7 @@ def endpoint_error(v_fn, x, e):
 
 
 @torch.no_grad()
-def mac_weights(err, percentile, add_weight):
+def mac_weights(err, percentile, add_weight, selection="model", generator=None, normalize=False):
     """
     Eq. 8 の w(x0, x1)。誤差が小さい上位 percentile 割のサンプルに 1 + add_weight、他は 1。
     戻り値: (weights [B], selected_mask [B] bool)
@@ -81,7 +81,30 @@ def mac_weights(err, percentile, add_weight):
     k = int(B * percentile)
     if k <= 0 or add_weight <= 0:
         return w, mask
-    _, idx = torch.topk(err, k, largest=False)
+    if not 0 <= percentile <= 1:
+        raise ValueError("percentile must be in [0, 1].")
+    if selection == "model":
+        _, idx = torch.topk(err, k, largest=False)
+    elif selection == "random":
+        if generator is None:
+            raise ValueError("Random selection requires an independent generator.")
+        idx = torch.randperm(B, device=err.device, generator=generator)[:k]
+    else:
+        raise ValueError(f"Unknown MAC selection: {selection}")
     mask[idx] = True
     w[idx] = 1.0 + add_weight
+    if normalize:
+        w = w / w.mean()
     return w, mask
+
+
+def apply_mac_losses(loss_main, loss_aux, weights, target="both"):
+    """Apply MAC after adaptive weighting, before averaging the batch."""
+    if target not in ("both", "main", "aux"):
+        raise ValueError(f"Unknown mac_target: {target}")
+    if weights is not None:
+        if target in ("both", "main"):
+            loss_main = loss_main * weights
+        if target in ("both", "aux"):
+            loss_aux = loss_aux * weights
+    return loss_main, loss_aux
