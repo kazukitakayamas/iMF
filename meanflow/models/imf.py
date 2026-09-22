@@ -24,7 +24,7 @@ import torch.nn as nn
 
 from models.ema import init_ema, update_ema_net
 from models.time_sampler import sample_two_timesteps
-from models.mac import endpoint_error, mac_weights, dup     # [MAC] 追加
+from models.mac import endpoint_error, mac_weights, dup, apply_mac_losses
 
 
 
@@ -35,6 +35,7 @@ class iMF(nn.Module):
         self.args = args
         self.num_classes = args.num_classes
         self.null_class = args.num_classes  # null クラスの id
+        self.mac_generator = None
 
         self.register_buffer("num_updates", torch.tensor(0))
         self.net_ema = init_ema(self.net, arch(**net_configs), args.ema_decay)
@@ -171,11 +172,20 @@ class iMF(nn.Module):
                 x, e,
             )
             scorer.train(was_training)
-            mac_w, mac_mask = mac_weights(err, mac_percentile, self.args.mac_weight)
+            if self.mac_generator is None:
+                self.mac_generator = torch.Generator(device).manual_seed(
+                    getattr(self.args, "mac_random_seed", 12345))
+            mac_w, mac_mask = mac_weights(
+                err, mac_percentile, self.args.mac_weight,
+                selection=getattr(self.args, "mac_selection", "model"),
+                generator=self.mac_generator,
+                normalize=getattr(self.args, "mac_normalize_weights", False),
+            )
             mac_stats = {
                 "mac_err": float(err.mean()),
                 "mac_err_sel": float(err[mac_mask].mean()) if mac_mask.any() else 0.0,
                 "mac_frac": float(mac_mask.float().mean()),
+                "mac_weight_mean": float(mac_w.mean()),
             }
 
       
@@ -211,11 +221,13 @@ class iMF(nn.Module):
             if self.args.v_head:
                 loss_v = adaptive_weight(((v_aux - v_g) ** 2).sum(dim=(1, 2, 3)))
 
-            # [MAC] Eq. 8: 適応重み付けの後にサンプル重み w を掛ける (公式と同じ順序)
-            if mac_w is not None:
-                loss_u = loss_u * mac_w
-                if self.args.v_head:
-                    loss_v = loss_v * mac_w
+            # Values before MAC (adaptive weighting already applied).
+            loss_u_unweighted = float(loss_u.mean().detach())
+            loss_v_unweighted = float(loss_v.mean().detach())
+            target = getattr(self.args, "mac_target", "both")
+            if mac_w is not None and target == "aux" and not self.args.v_head:
+                raise ValueError("mac_target=aux requires v_head=True.")
+            loss_u, loss_v = apply_mac_losses(loss_u, loss_v, mac_w, target)
 
             loss = loss_u
             if self.args.v_head:
@@ -225,6 +237,8 @@ class iMF(nn.Module):
         return loss, {
             "loss_u": float(loss_u.mean().detach()),
             "loss_v": float(loss_v.mean().detach()),
+            "loss_u_unweighted": loss_u_unweighted,
+            "loss_v_unweighted": loss_v_unweighted,
             **mac_stats,
         }
 
