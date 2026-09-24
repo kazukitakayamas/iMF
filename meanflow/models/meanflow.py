@@ -3,7 +3,7 @@ import torch
 import torch.nn as nn
 
 from models.time_sampler import sample_two_timesteps
-from models.mac import endpoint_error, mac_weights, dup     # [MAC] 追加
+from models.mac import endpoint_error, pair_score, mac_weights, dup     # [MAC] 追加
 from models.ema import init_ema, update_ema_net
 
 
@@ -50,11 +50,17 @@ class MeanFlow(nn.Module):
             scorer = self.net_ema if getattr(self.args, "mac_scorer", "ema") == "ema" else self.net
             was_training = scorer.training
             scorer.eval()
-            aug_score = dup(aug_cond)   # 採点は 2B バッチで 1 回 forward
-            err = endpoint_error(
-                lambda z_, t_: scorer(z_, (t_.view(-1), torch.zeros_like(t_).view(-1)), aug_score),
-                x, e,
-            )
+            aug_score = dup(aug_cond)   # h0 の採点は 2B バッチで 1 回 forward
+
+            def v_score(z_, t_):   # h0: 瞬時速度 (h=0)。元の MAC と同じ
+                return scorer(z_, (t_.view(-1), torch.zeros_like(t_).view(-1)), aug_score)
+
+            def u1_score(e_):      # h1: 平均速度 u(e, r=0, t=1)。1-NFE で使う量
+                one = torch.ones(e_.shape[0], device=e_.device, dtype=e_.dtype)
+                return scorer(e_, (one, one), aug_cond)
+
+            # [MAC-score] "h0" = 元の MAC (既定) / "h1" / "mix"
+            err, _ = pair_score(getattr(self.args, "mac_score", "h0"), v_score, u1_score, x, e)
             scorer.train(was_training)
             mac_w, _ = mac_weights(err, mac_percentile, self.args.mac_weight)
             
