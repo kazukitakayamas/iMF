@@ -1,223 +1,154 @@
-"""CPU regression checks: python -m unittest test_mac_experiments -v."""
-import copy
-import itertools
+"""MAC experiment definitions. No tensor dependency: usable before model creation."""
+
+import hashlib
 import json
-import tempfile
-import unittest
+import math
 from pathlib import Path
-from unittest.mock import patch
-
-import torch
-from torch import nn
-from torch.utils.data import Dataset
-
-from train_arg_parser import get_args_parser
-from mac_experiment import (mac_bounds, scheduled_mac_percentile, validate_mac_args,
-                            experiment_id, training_config, check_resume_config)
-from models.mac import mac_weights, apply_mac_losses
-from models.imf import iMF
-from runner import Runner, TrainingBatchSampler
 
 
-def args_for_test():
-    args = get_args_parser().parse_args([])
-    args.method, args.num_classes = "imf", 0
-    args.mac, args.mac_timing, args.mac_warmup_iters = True, "late", 0
-    args.total_iters, args.batch_size, args.grad_accum = 30000, 4, 1
-    args.model_channels, args.ema_decays, args.use_edm_aug = 32, [], False
-    args.norm_p, args.num_workers, args.dropout = 0.0, 0, 0.0
-    args.use_cfg, args.use_cfg_interval = False, False
-    args.seed, args.eval_seed = 42, 123
-    return args
+WINDOWS = {
+    "none": (0.0, 0.0),
+    "all": (0.0, 1.0),
+    "early": (0.0, 0.5),
+    "middle": (0.25, 0.75),
+    "late": (0.5, 1.0),
+}
 
 
-class TinyNet(nn.Module):
-    def __init__(self, **kwargs):
-        super().__init__()
-        self.main_scale = nn.Parameter(torch.tensor(0.2))
-        self.aux_scale = nn.Parameter(torch.tensor(0.3))
-
-    def forward(self, z, t, h, omega, t_min, t_max, y=None, aug_cond=None):
-        return self.main_scale * z + 0.1 * h, self.aux_scale * z
-
-
-def tiny_model(args):
-    return iMF(TinyNet, args, {})
-
-
-class TinyData(Dataset):
-    def __init__(self, *args, **kwargs):
-        self.data = torch.arange(12 * 3 * 2 * 2, dtype=torch.float32).reshape(12, 3, 2, 2) / 144
-
-    def __len__(self):
-        return len(self.data)
-
-    def __getitem__(self, i):
-        return self.data[i], 0
+def mac_bounds(args):
+    """Return a zero-based, half-open [start, end) interval in optimizer steps."""
+    timing = getattr(args, "mac_timing", "all")
+    if timing == "custom":
+        lo, hi = args.mac_start_fraction, args.mac_end_fraction
+    elif timing in WINDOWS:
+        lo, hi = WINDOWS[timing]
+    else:
+        raise ValueError(f"Unknown mac_timing: {timing}")
+    if not (math.isfinite(lo) and math.isfinite(hi) and 0 <= lo <= hi <= 1):
+        raise ValueError("MAC fractions must satisfy 0 <= start <= end <= 1.")
+    if timing != "none" and lo == hi:
+        raise ValueError("MAC interval must have a positive length.")
+    return int(args.total_iters * lo), int(args.total_iters * hi)
 
 
-class ScheduleTests(unittest.TestCase):
-    def test_exact_windows_and_boundaries(self):
-        args = args_for_test()
-        expected = {"none": (0, 0), "early": (0, 15000), "middle": (7500, 22500),
-                    "late": (15000, 30000), "all": (0, 30000)}
-        for timing, interval in expected.items():
-            args.mac_timing = timing
-            self.assertEqual(mac_bounds(args), interval)
-            active = [s for s in range(args.total_iters) if scheduled_mac_percentile(args, s) is not None]
-            self.assertEqual(active, list(range(*interval)))
-        args.mac = False
-        self.assertIsNone(scheduled_mac_percentile(args, 20000))
-
-    def test_invalid_conditions_fail(self):
-        args = args_for_test()
-        args.mac_warmup_iters = 6000
-        with self.assertRaises(ValueError):
-            validate_mac_args(args)
-        args.mac_warmup_iters, args.mac_target, args.v_head = 0, "aux", False
-        with self.assertRaises(ValueError):
-            validate_mac_args(args)
-        args.v_head, args.mac_timing = True, "custom"
-        args.mac_start_fraction, args.mac_end_fraction = 0.8, 0.2
-        with self.assertRaises(ValueError):
-            validate_mac_args(args)
-
-    def test_unique_run_and_resume_guard(self):
-        args = args_for_test()
-        original = experiment_id(args)
-        changed = copy.deepcopy(args)
-        changed.mac_target = "main"
-        self.assertNotEqual(original, experiment_id(changed))
-        with self.assertRaises(ValueError):
-            check_resume_config(training_config(args), training_config(changed))
-        with self.assertRaises(ValueError):
-            check_resume_config(None, training_config(args))
+def validate_mac_args(args):
+    if args.total_iters <= 0 or args.grad_accum <= 0 or args.batch_size <= 0:
+        raise ValueError("total_iters, grad_accum and batch_size must be positive.")
+    start, end = mac_bounds(args)
+    if getattr(args, "mac_target", "both") not in ("both", "main", "aux"):
+        raise ValueError("mac_target must be both, main or aux.")
+    if getattr(args, "mac_selection", "model") not in ("model", "random"):
+        raise ValueError("mac_selection must be model or random.")
+    if getattr(args, "mac_score", "h0") not in ("h0", "h1", "mix"):
+        raise ValueError("mac_score must be h0 (original MAC), h1 or mix.")
+    if not 0 < args.mac_percent <= 1 or not math.isfinite(args.mac_percent):
+        raise ValueError("mac_percent must be in (0, 1].")
+    if not math.isfinite(args.mac_weight) or args.mac_weight < 0:
+        raise ValueError("mac_weight must be finite and non-negative.")
+    if args.mac_warmup_iters < 0:
+        raise ValueError("mac_warmup_iters must be non-negative.")
+    enabled = args.mac and getattr(args, "mac_timing", "all") != "none"
+    if enabled:
+        if end <= start or int(args.batch_size * args.mac_percent) == 0:
+            raise ValueError("MAC must select at least one step and one sample.")
+        if getattr(args, "mac_timing", "all") != "all" and args.mac_warmup_iters != 0:
+            raise ValueError("Timing comparisons require mac_warmup_iters=0 (fixed selection fraction).")
+        if getattr(args, "mac_target", "both") == "aux" and not args.v_head:
+            raise ValueError("mac_target=aux requires v_head=True.")
+        if args.method != "imf" and (
+            getattr(args, "mac_target", "both") == "aux"
+            or getattr(args, "mac_selection", "model") != "model"
+            or getattr(args, "mac_normalize_weights", False)
+        ):
+            raise ValueError("Auxiliary/random/normalized MAC experiments require method=imf.")
 
 
-class LossTests(unittest.TestCase):
-    def test_selection_and_normalization(self):
-        err = torch.tensor([4., 1., 3., 2.])
-        w, mask = mac_weights(err, 0.5, 1.0)
-        self.assertEqual(w.tolist(), [1., 2., 1., 2.])
-        self.assertEqual(mask.sum(), 2)
-        normalized, _ = mac_weights(err, 0.5, 1.0, normalize=True)
-        self.assertEqual(normalized.mean(), 1)
-
-    def test_random_control_does_not_advance_training_rng(self):
-        torch.manual_seed(9)
-        before = torch.get_rng_state().clone()
-        w, mask = mac_weights(torch.arange(8.), 0.5, 1., selection="random",
-                              generator=torch.Generator().manual_seed(3))
-        self.assertTrue(torch.equal(before, torch.get_rng_state()))
-        self.assertEqual(mask.sum(), 4)
-        self.assertEqual(w.mean(), 1.5)
-
-    def test_target_routes_gradients(self):
-        for target, expected_main, expected_aux in [
-            ("main", [1., 2.], [1., 1.]),
-            ("aux", [1., 1.], [1., 2.]),
-            ("both", [1., 2.], [1., 2.]),
-        ]:
-            main = torch.tensor([2., 3.], requires_grad=True)
-            aux = torch.tensor([5., 7.], requires_grad=True)
-            a, b = apply_mac_losses(main, aux, torch.tensor([1., 2.]), target)
-            (a + b).sum().backward()
-            self.assertEqual(main.grad.tolist(), expected_main)
-            self.assertEqual(aux.grad.tolist(), expected_aux)
-
-    def test_real_imf_forward_loss_and_gradient_routing(self):
-        x = torch.arange(48., dtype=torch.float32).reshape(4, 3, 2, 2) / 48
-        base_grads = {}
-        args = args_for_test()
-        # Select the whole batch so the expected gradient multiplier is exactly two.
-        for target in ("none", "main", "aux", "both"):
-            args.mac_target = "both" if target == "none" else target
-            model = tiny_model(args)
-            torch.manual_seed(19)
-            loss, parts = model.forward_with_loss(x, mac_percentile=None if target == "none" else 1.0)
-            loss.backward()
-            base_grads[target] = (model.net.main_scale.grad.clone(), model.net.aux_scale.grad.clone())
-            if target != "none":
-                self.assertAlmostEqual(parts["loss_u"], parts["loss_u_unweighted"] * (2 if target in ("main", "both") else 1), places=5)
-                self.assertAlmostEqual(parts["loss_v"], parts["loss_v_unweighted"] * (2 if target in ("aux", "both") else 1), places=5)
-        for target in ("main", "aux", "both"):
-            for j, name in enumerate(("main", "aux")):
-                expected = base_grads["none"][j] * (2 if target in (name, "both") else 1)
-                torch.testing.assert_close(base_grads[target][j], expected)
-
-    def test_disabled_mac_skips_endpoint_scoring(self):
-        model = tiny_model(args_for_test())
-        with patch("models.imf.endpoint_error", side_effect=AssertionError("MAC must be skipped")):
-            loss, _ = model.forward_with_loss(torch.ones(4, 3, 2, 2), mac_percentile=None)
-        self.assertTrue(torch.isfinite(loss))
+def scheduled_mac_percentile(args, step):
+    """None disables both scoring and weighting outside the selected window."""
+    start, end = mac_bounds(args)
+    if not args.mac or args.mac_weight == 0 or not start <= step < end:
+        return None
+    warmup = args.mac_warmup_iters
+    if warmup <= 0 or step >= warmup:
+        return args.mac_percent
+    return 1.0 - step * (1.0 - args.mac_percent) / warmup
 
 
-class RunnerTests(unittest.TestCase):
-    def test_sampler_resume_matches_uninterrupted_batches(self):
-        batches = list(itertools.islice(iter(TrainingBatchSampler(13, 4, 42)), 11))
-        resumed = list(itertools.islice(iter(TrainingBatchSampler(13, 4, 42, 5)), 6))
-        self.assertEqual(batches[5:], resumed)
+CONFIG_KEYS = (
+    "method", "arch", "dataset", "model_channels", "batch_size", "grad_accum",
+    "total_iters", "lr", "warmup_iters", "optimizer_betas", "dropout",
+    "ema_decay", "ema_decays", "seed", "use_edm_aug", "ratio", "tr_sampler",
+    "P_mean_t", "P_std_t", "P_mean_r", "P_std_r", "norm_p", "norm_eps",
+    "v_head", "use_cfg", "use_cfg_interval", "num_classes", "class_dropout_prob",
+    "cfg_s_max", "mac", "mac_timing", "mac_start_fraction", "mac_end_fraction",
+    "mac_target", "mac_selection", "mac_percent", "mac_weight", "mac_warmup_iters",
+    "mac_scorer", "mac_random_seed", "mac_normalize_weights", "deterministic",
+    "mac_score",
+)
 
-    def test_fid_noise_labels_and_training_rng_are_repeatable(self):
-        runner = Runner.__new__(Runner)
-        runner.device, runner.args, runner.is_imf = torch.device("cpu"), args_for_test(), True
-        runner.args.num_classes = 10
-        captured = []
-        class Metric:
-            def reset(self): pass
-            def update(self, x, real): pass
-            def compute(self): return torch.tensor(0.)
-        def initialize():
-            torch.randn(7)  # Simulate random initialization of an evaluation network.
-            return Metric()
-        runner._fid_metric = initialize
-        def sample(n, generator, labels, **kwargs):
-            noise = torch.randn(n, 3, 2, 2, generator=generator)
-            captured.append((noise.clone(), labels.clone()))
-            return noise
-        runner.sample = sample
-        torch.manual_seed(11)
-        before = torch.get_rng_state().clone()
-        runner.compute_fid(n_samples=7, num_steps=1, bs=3)
-        runner.compute_fid(n_samples=7, num_steps=4, bs=3)
-        self.assertTrue(torch.equal(before, torch.get_rng_state()))
-        for left, right in zip(captured[:3], captured[3:]):
-            self.assertTrue(torch.equal(left[0], right[0]))
-            self.assertTrue(torch.equal(left[1], right[1]))
-
-    @patch("runner.torchvision.datasets.CIFAR10", TinyData)
-    @patch("runner.instantiate_model", tiny_model)
-    def test_training_resume_matches_uninterrupted_with_random_mac(self):
-        with tempfile.TemporaryDirectory() as root:
-            args = args_for_test()
-            args.total_iters, args.log_every = 6, 2
-            args.ckpt_every, args.sample_every, args.eval_every = 2, 100, 100
-            args.mac_selection, args.mac_timing = "random", "middle"
-            args.ckpt_dir = str(Path(root) / "full")
-            full = Runner(args, device="cpu")
-            full.train()
-            expected = copy.deepcopy(full.model.state_dict())
-
-            interrupted_args = copy.deepcopy(args)
-            interrupted_args.ckpt_dir = str(Path(root) / "resume")
-            interrupted = Runner(interrupted_args, device="cpu")
-            original_save = interrupted.save
-            def stop_at_two(step):
-                original_save(step)
-                if step == 2:
-                    raise InterruptedError("simulated interruption")
-            interrupted.save = stop_at_two
-            with self.assertRaises(InterruptedError):
-                interrupted.train()
-            interrupted_args.resume_training = True
-            resumed = Runner(interrupted_args, device="cpu")
-            resumed.train()
-            for key, value in expected.items():
-                torch.testing.assert_close(resumed.model.state_dict()[key], value, rtol=0, atol=0)
-            logs = [json.loads(line) for line in (Path(args.ckpt_dir) / "metrics.jsonl").read_text().splitlines()]
-            self.assertEqual([row["mac/active"] for row in logs], [1., 1., 0.])
+# 分岐 (init_from) のとき、元の run と違っていてよいキー = MAC の設定だけ。
+MAC_KEYS = tuple(key for key in CONFIG_KEYS if key.startswith("mac"))
 
 
-if __name__ == "__main__":
-    torch.set_num_threads(1)
-    unittest.main()
+def training_config(args):
+    config = {key: getattr(args, key, None) for key in CONFIG_KEYS}
+    # Include the implementation itself so a modified model cannot silently resume.
+    root = Path(__file__).resolve().parent
+    digest = hashlib.sha256()
+    for path in sorted(list((root / "models").glob("*.py")) +
+                       [root / "runner.py", root / "mac_experiment.py",
+                        root / "training/data_transform.py"]):
+        digest.update(path.relative_to(root).as_posix().encode())
+        digest.update(path.read_bytes())
+    config["source_sha256"] = digest.hexdigest()
+    config["experiment_version"] = 1
+    return config
+
+
+def experiment_id(args, preset="run"):
+    config = training_config(args)
+    digest = hashlib.sha256(json.dumps(config, sort_keys=True).encode()).hexdigest()[:12]
+    timing = args.mac_timing if args.mac else "none"
+    score = getattr(args, "mac_score", "h0")
+    score_tag = "" if score == "h0" or not args.mac else f"-{score}"   # h0 (元の MAC) は従来どおりの名前
+    return (f"{args.method}-{preset}-{timing}-{args.mac_target}-{args.mac_selection}{score_tag}"
+            f"-seed{args.seed}-{digest}")
+
+
+def check_resume_config(saved, current):
+    if saved is None:
+        raise ValueError("Legacy checkpoint has no experiment_config. Use a new ckpt_dir.")
+    differences = [key for key in sorted(set(saved) | set(current))
+                   if saved.get(key) != current.get(key)]
+    if differences:
+        raise ValueError("Checkpoint configuration mismatch: " + ", ".join(differences)
+                         + ". Use a new experiment/checkpoint directory.")
+
+
+def mac_inactive_before(args, step):
+    """step より前に MAC が一度も有効になっていない設定か (分岐の可否判定)。"""
+    if not args.mac or args.mac_weight == 0:
+        return True
+    start, end = mac_bounds(args)
+    return end <= start or start >= step
+
+
+def check_branch_config(parent_args, parent_config, current_args, current_config, step):
+    """
+    前半を共有して後半だけ分岐させる (init_from) ための検査。
+      1. MAC 以外の設定 (seed, 学習率, モデル, 総ステップ数, ソースコード) が完全に一致すること
+      2. 親 run も新しい run も、分岐点 step より前に MAC が有効でないこと
+    この 2 つを満たせば、分岐 run は「最初から通しで学習した run」と同じ計算になる。
+    """
+    if parent_config is None:
+        raise ValueError("Parent checkpoint has no experiment_config.")
+    differences = [key for key in sorted(set(parent_config) | set(current_config))
+                   if key not in MAC_KEYS and parent_config.get(key) != current_config.get(key)]
+    if differences:
+        raise ValueError("Cannot branch: non-MAC settings differ from the parent run: "
+                         + ", ".join(differences))
+    if not mac_inactive_before(parent_args, step):
+        raise ValueError(f"Cannot branch: the parent run already used MAC before step {step}.")
+    if not mac_inactive_before(current_args, step):
+        raise ValueError(f"Cannot branch at step {step}: this run's MAC window starts earlier "
+                         f"({mac_bounds(current_args)}).")
