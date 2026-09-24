@@ -69,6 +69,62 @@ def endpoint_error(v_fn, x, e):
     return 0.5 * (err[:B] + err[B:])               # [B]
 
 
+MAC_SCORES = ("h0", "h1", "mix")
+
+
+@torch.no_grad()
+def onestep_error(u1_fn, x, e):
+    """
+    [MAC-h1] 1-NFE (平均速度, gap h = t - r = 1) での結合の採点。shape [B]。
+
+        s1(x, e) = mean || u_theta(e, r=0, t=1) - (e - x) ||^2
+                 = mean || x_hat(e) - x ||^2,   x_hat(e) = e - u_theta(e, 0, 1)  (1-NFE サンプル)
+
+    つまり「ノイズ e から今のモデルが 1 ステップで作る画像」と、ランダムに組まれた
+    データ x との距離。元の MAC (endpoint_error) は h=0 の瞬時速度しか見ないので、
+    1-NFE が使う平均速度 u(e,0,1) とは採点の基準がずれている、という仮説を検証するための採点。
+
+    u1_fn(e): u_theta(e, r=0, t=1) を返す関数 (omega=1, 無ガイダンス, EMA 推奨)。B バッチ。
+    """
+    u = u1_fn(e)
+    err = F.mse_loss(u, e - x, reduction="none")
+    return err.mean(dim=tuple(range(1, err.ndim)))  # [B]
+
+
+@torch.no_grad()
+def rank01(v):
+    """スコア -> [0, 1] の順位 (小さいほど 0)。スケールの違う採点を平均するため。"""
+    r = torch.empty_like(v)
+    r[torch.argsort(v)] = torch.arange(len(v), device=v.device, dtype=v.dtype)
+    return r / max(len(v) - 1, 1)
+
+
+@torch.no_grad()
+def pair_score(score, v_fn, u1_fn, x, e):
+    """
+    MAC の採点を切り替える。戻り値: (score [B], stats dict)。値が小さいほど「学習しやすい結合」。
+
+      "h0"  : 元の MAC。瞬時速度 (h=0) の 2 端点誤差 = endpoint_error。 <- 既定・従来と完全に同じ
+      "h1"  : 1-NFE 向け。平均速度 u(e,0,1) の誤差 = onestep_error
+      "mix" : h0 と h1 をそれぞれ順位に直して平均 (スケールの違いで片方に引きずられないように)
+    """
+    if score not in MAC_SCORES:
+        raise ValueError(f"Unknown mac_score: {score}")
+    stats = {}
+    s0 = s1 = None
+    if score in ("h0", "mix"):
+        s0 = endpoint_error(v_fn, x, e)
+        stats["mac_err_h0"] = float(s0.mean())
+    if score in ("h1", "mix"):
+        s1 = onestep_error(u1_fn, x, e)
+        stats["mac_err_h1"] = float(s1.mean())
+    if score == "h0":
+        return s0, stats
+    if score == "h1":
+        return s1, stats
+    return 0.5 * (rank01(s0) + rank01(s1)), stats
+
+
 @torch.no_grad()
 def mac_weights(err, percentile, add_weight, selection="model", generator=None, normalize=False):
     """
