@@ -113,6 +113,10 @@ def get_args_parser():
     parser.add_argument("--mac_selection", default="model", choices=["model", "random"])
     parser.add_argument("--mac_random_seed", default=12345, type=int)
     parser.add_argument("--mac_normalize_weights", action="store_true", default=False)
+    parser.add_argument("--mac_score", default="h0", choices=["h0", "h1", "mix"],
+                        help="[MAC] Coupling score. h0: original MAC (instantaneous velocity at both "
+                             "endpoints). h1: one-step average velocity u(e, r=0, t=1), i.e. distance "
+                             "between the 1-NFE sample from e and x. mix: rank average of h0 and h1.")
 
     # ------------------------------------------------------------------
     # [iMF] Single-GPU / Colab runner (iteration based; the DDP path above is epoch based)
@@ -132,5 +136,9 @@ def get_args_parser():
     parser.add_argument("--resume_training", action="store_true", default=False,
                         help="Explicitly resume a matching checkpoint in the Colab Runner.")
     parser.add_argument("--deterministic", action="store_true", default=False)
+    parser.add_argument("--snapshot_steps", nargs="*", type=int, default=[],
+                        help="Also keep step_<N>.pt at these steps (e.g. 15000 = branch point for late MAC).")
+    parser.add_argument("--init_from", default="", type=str,
+                        help="Start from another run's step_<N>.pt (shared first half, MAC settings may differ).")
 
     return parser
