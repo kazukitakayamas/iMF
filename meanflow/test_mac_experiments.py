@@ -1,154 +1,144 @@
-"""MAC experiment definitions. No tensor dependency: usable before model creation."""
-
-import hashlib
-import json
-import math
-from pathlib import Path
-
-
-WINDOWS = {
-    "none": (0.0, 0.0),
-    "all": (0.0, 1.0),
-    "early": (0.0, 0.5),
-    "middle": (0.25, 0.75),
-    "late": (0.5, 1.0),
-}
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the CC-by-NC license found in the
+# LICENSE file in the root directory of this source tree.
+import argparse
+import logging
 
 
-def mac_bounds(args):
-    """Return a zero-based, half-open [start, end) interval in optimizer steps."""
-    timing = getattr(args, "mac_timing", "all")
-    if timing == "custom":
-        lo, hi = args.mac_start_fraction, args.mac_end_fraction
-    elif timing in WINDOWS:
-        lo, hi = WINDOWS[timing]
-    else:
-        raise ValueError(f"Unknown mac_timing: {timing}")
-    if not (math.isfinite(lo) and math.isfinite(hi) and 0 <= lo <= hi <= 1):
-        raise ValueError("MAC fractions must satisfy 0 <= start <= end <= 1.")
-    if timing != "none" and lo == hi:
-        raise ValueError("MAC interval must have a positive length.")
-    return int(args.total_iters * lo), int(args.total_iters * hi)
+logger = logging.getLogger(__name__)
 
 
-def validate_mac_args(args):
-    if args.total_iters <= 0 or args.grad_accum <= 0 or args.batch_size <= 0:
-        raise ValueError("total_iters, grad_accum and batch_size must be positive.")
-    start, end = mac_bounds(args)
-    if getattr(args, "mac_target", "both") not in ("both", "main", "aux"):
-        raise ValueError("mac_target must be both, main or aux.")
-    if getattr(args, "mac_selection", "model") not in ("model", "random"):
-        raise ValueError("mac_selection must be model or random.")
-    if getattr(args, "mac_score", "h0") not in ("h0", "h1", "mix"):
-        raise ValueError("mac_score must be h0 (original MAC), h1 or mix.")
-    if not 0 < args.mac_percent <= 1 or not math.isfinite(args.mac_percent):
-        raise ValueError("mac_percent must be in (0, 1].")
-    if not math.isfinite(args.mac_weight) or args.mac_weight < 0:
-        raise ValueError("mac_weight must be finite and non-negative.")
-    if args.mac_warmup_iters < 0:
-        raise ValueError("mac_warmup_iters must be non-negative.")
-    enabled = args.mac and getattr(args, "mac_timing", "all") != "none"
-    if enabled:
-        if end <= start or int(args.batch_size * args.mac_percent) == 0:
-            raise ValueError("MAC must select at least one step and one sample.")
-        if getattr(args, "mac_timing", "all") != "all" and args.mac_warmup_iters != 0:
-            raise ValueError("Timing comparisons require mac_warmup_iters=0 (fixed selection fraction).")
-        if getattr(args, "mac_target", "both") == "aux" and not args.v_head:
-            raise ValueError("mac_target=aux requires v_head=True.")
-        if args.method != "imf" and (
-            getattr(args, "mac_target", "both") == "aux"
-            or getattr(args, "mac_selection", "model") != "model"
-            or getattr(args, "mac_normalize_weights", False)
-        ):
-            raise ValueError("Auxiliary/random/normalized MAC experiments require method=imf.")
+def get_args_parser():
+    parser = argparse.ArgumentParser("Image dataset training", add_help=False)
 
+    # Optimizer parameters
+    parser.add_argument("--batch_size", default=64, type=int, help="Batch size per GPU (effective batch size is batch_size * # gpus")
+    parser.add_argument("--epochs", default=4000, type=int)
+    parser.add_argument("--lr", default=0.0006, type=float, help="learning rate (absolute lr)")
+    parser.add_argument("--optimizer_betas", default=[0.9, 0.999], nargs="+", type=float, help="beta1 and beta2 for Adam optimizer")
+    parser.add_argument("--warmup_epochs", default=200, type=int, help="Number of warmup epochs.")
+    parser.add_argument("--dropout", default=0.2, type=float, help="Dropout rate.")
 
-def scheduled_mac_percentile(args, step):
-    """None disables both scoring and weighting outside the selected window."""
-    start, end = mac_bounds(args)
-    if not args.mac or args.mac_weight == 0 or not start <= step < end:
-        return None
-    warmup = args.mac_warmup_iters
-    if warmup <= 0 or step >= warmup:
-        return args.mac_percent
-    return 1.0 - step * (1.0 - args.mac_percent) / warmup
+    parser.add_argument("--ema_decay", default=0.9999, type=float, help="Exponential moving average decay rate.")
+    parser.add_argument("--ema_decays", default=[0.99995, 0.9996], nargs="+", type=float, help="Extra EMA decay rates.")
 
+    # Dataset parameters
+    parser.add_argument("--dataset", default='cifar10', type=str, choices=['cifar10', 'mnist'], help="Dataset to use.")
+    parser.add_argument("--data_path", default="./data", type=str, help="data root folder with train, val and test subfolders")
 
-CONFIG_KEYS = (
-    "method", "arch", "dataset", "model_channels", "batch_size", "grad_accum",
-    "total_iters", "lr", "warmup_iters", "optimizer_betas", "dropout",
-    "ema_decay", "ema_decays", "seed", "use_edm_aug", "ratio", "tr_sampler",
-    "P_mean_t", "P_std_t", "P_mean_r", "P_std_r", "norm_p", "norm_eps",
-    "v_head", "use_cfg", "use_cfg_interval", "num_classes", "class_dropout_prob",
-    "cfg_s_max", "mac", "mac_timing", "mac_start_fraction", "mac_end_fraction",
-    "mac_target", "mac_selection", "mac_percent", "mac_weight", "mac_warmup_iters",
-    "mac_scorer", "mac_random_seed", "mac_normalize_weights", "deterministic",
-    "mac_score",
-)
+    parser.add_argument("--output_dir", default="./output_dir", help="path where to save, empty for no saving")
+    parser.add_argument("--fid_samples", default=50000, type=int, help="number of synthetic samples for FID evaluations")
+    parser.add_argument("--device", default="cuda", help="device to use for training / testing")
+    parser.add_argument("--seed", default=0, type=int)
+    parser.add_argument("--resume", default="", help="resume from checkpoint")
 
-# 分岐 (init_from) のとき、元の run と違っていてよいキー = MAC の設定だけ。
-MAC_KEYS = tuple(key for key in CONFIG_KEYS if key.startswith("mac"))
+    parser.add_argument("--start_epoch", default=0, type=int, metavar="N", help="start epoch (used when resumed from checkpoint)")
+    parser.add_argument("--eval_only", action="store_true", help="No training, only run evaluation")
+    parser.add_argument("--eval_frequency", default=50, type=int, help="Frequency (in number of epochs) for running FID evaluation. -1 to never run evaluation.")
+    parser.add_argument("--compute_fid", action="store_true", help="Whether to compute FID in the evaluation loop. When disabled, the evaluation loop still runs and saves snapshots, but skips the FID computation.")
+    parser.add_argument("--save_fid_samples", action="store_true", help="Save all samples generated for FID computation.")
+    parser.add_argument("--num_workers", default=10, type=int)
+    parser.add_argument("--pin_mem", action="store_true", help="Pin CPU memory in DataLoader for more efficient (sometimes) transfer to GPU.")
+    parser.add_argument("--no_pin_mem", action="store_false", dest="pin_mem")
+    parser.set_defaults(pin_mem=True)
+    parser.add_argument("--log_per_step", default=100, type=int, metavar="N", help="Log training stats every N iterations",)
 
+    # Distributed training parameters
+    parser.add_argument("--world_size", default=1, type=int, help="number of distributed processes")
+    parser.add_argument("--local_rank", default=-1, type=int)
+    parser.add_argument("--dist_on_itp", action="store_true")
+    parser.add_argument("--dist_url", default="env://", help="url used to set up distributed training")
 
-def training_config(args):
-    config = {key: getattr(args, key, None) for key in CONFIG_KEYS}
-    # Include the implementation itself so a modified model cannot silently resume.
-    root = Path(__file__).resolve().parent
-    digest = hashlib.sha256()
-    for path in sorted(list((root / "models").glob("*.py")) +
-                       [root / "runner.py", root / "mac_experiment.py",
-                        root / "training/data_transform.py"]):
-        digest.update(path.relative_to(root).as_posix().encode())
-        digest.update(path.read_bytes())
-    config["source_sha256"] = digest.hexdigest()
-    config["experiment_version"] = 1
-    return config
+    # MeanFlow specific parameters
+    parser.add_argument("--ratio", default=0.75, type=float, help="Probability of sampling r (or h) DIFFERENT from t")  
 
+    parser.add_argument("--tr_sampler", default="v1", type=str, choices=["v0", "v1"], help="Joint (t, r) sampler version.")
 
-def experiment_id(args, preset="run"):
-    config = training_config(args)
-    digest = hashlib.sha256(json.dumps(config, sort_keys=True).encode()).hexdigest()[:12]
-    timing = args.mac_timing if args.mac else "none"
-    score = getattr(args, "mac_score", "h0")
-    score_tag = "" if score == "h0" or not args.mac else f"-{score}"   # h0 (元の MAC) は従来どおりの名前
-    return (f"{args.method}-{preset}-{timing}-{args.mac_target}-{args.mac_selection}{score_tag}"
-            f"-seed{args.seed}-{digest}")
+    parser.add_argument("--P_mean_t", default=-0.6, type=float, help="P_mean_t of lognormal sampler.")
+    parser.add_argument("--P_std_t", default=1.6, type=float, help="P_std_t of lognormal sampler.")
+    parser.add_argument("--P_mean_r", default=-4.0, type=float, help="P_mean_r of lognormal sampler.")
+    parser.add_argument("--P_std_r", default=1.6, type=float, help="P_std_r of lognormal sampler.")
+    
+    parser.add_argument("--norm_p", default=0.75, type=float, help="Norm power for adaptive weight.")
+    parser.add_argument("--norm_eps", default=1e-3, type=float, help="Small constant for adaptive weight division.")
+    parser.add_argument("--arch", default="unet", type=str, choices=["unet",], help="Architecture to use.")
+    parser.add_argument("--use_edm_aug", action="store_true", dest="use_edm_aug", default=False, help="Enable EDM augmentation with augment labels as conditions.")
 
+    # Debugging settings
+    parser.add_argument("--test_run", action="store_true", help="Only run one batch of training and evaluation.")
+    parser.add_argument("--not_compile", action="store_false", dest="compile", default=True, help="Disable compilation.")
 
-def check_resume_config(saved, current):
-    if saved is None:
-        raise ValueError("Legacy checkpoint has no experiment_config. Use a new ckpt_dir.")
-    differences = [key for key in sorted(set(saved) | set(current))
-                   if saved.get(key) != current.get(key)]
-    if differences:
-        raise ValueError("Checkpoint configuration mismatch: " + ", ".join(differences)
-                         + ". Use a new experiment/checkpoint directory.")
+    # ------------------------------------------------------------------
+    # [iMF] improved MeanFlow (Geng et al., CVPR 2026)
+    # ------------------------------------------------------------------
+    parser.add_argument("--method", default="mf", type=str, choices=["mf", "imf"],
+                        help="Training objective: original MeanFlow or improved MeanFlow.")
+    parser.add_argument("--v_head", action="store_true", default=True,
+                        help="[iMF] Use the auxiliary v-head (Sec 4.1).")
+    parser.add_argument("--no_v_head", action="store_false", dest="v_head",
+                        help="[iMF] Use the boundary condition v(z,t)=u(z,t,t) instead.")
+    parser.add_argument("--use_cfg", action="store_true", default=False,
+                        help="[iMF] Flexible guidance conditioning (Sec 4.2). Requires num_classes > 0.")
+    parser.add_argument("--use_cfg_interval", action="store_true", default=False,
+                        help="[iMF] Also condition on the guidance interval (t_min, t_max).")
+    parser.add_argument("--num_classes", default=0, type=int,
+                        help="[iMF] 0 = class-unconditional. CIFAR-10 class-conditional = 10.")
+    parser.add_argument("--class_dropout_prob", default=0.1, type=float,
+                        help="[iMF] Probability of dropping the class condition.")
+    parser.add_argument("--cfg_s_max", default=3.0, type=float,
+                        help="[iMF] omega is sampled from [1, 1+s_max]. Official ImageNet value is 7.0.")
 
+    # ------------------------------------------------------------------
+    # [MAC] Model-Aligned Coupling (Lin et al., CVPR Findings 2026)
+    # ------------------------------------------------------------------
+    parser.add_argument("--mac", action="store_true", default=False,
+                        help="[MAC] Reweight low-endpoint-error couplings (Algorithm 1 / Eq. 8).")
+    parser.add_argument("--mac_percent", default=0.5, type=float,
+                        help="[MAC] k: fraction of couplings selected as S_theta. Paper default 0.5.")
+    parser.add_argument("--mac_weight", default=1.0, type=float,
+                        help="[MAC] lambda: extra loss weight on S_theta. Paper default 1.0.")
+    parser.add_argument("--mac_warmup_iters", default=20_000, type=int,
+                        help="[MAC] Linearly anneal the selected fraction 1.0 -> mac_percent over this many steps "
+                             "(official main.py: 20000). Use ~0.2*total_iters for short runs; 0 disables annealing.")
+    parser.add_argument("--mac_scorer", default="ema", type=str, choices=["ema", "net"],
+                        help="[MAC] Which network scores the couplings. Official code uses the EMA model.")
+    parser.add_argument("--mac_timing", default="all",
+                        choices=["none", "all", "early", "middle", "late", "custom"])
+    parser.add_argument("--mac_start_fraction", default=0.0, type=float)
+    parser.add_argument("--mac_end_fraction", default=1.0, type=float)
+    parser.add_argument("--mac_target", default="both", choices=["both", "main", "aux"],
+                        help="iMF loss to reweight; main denotes the composite V loss.")
+    parser.add_argument("--mac_selection", default="model", choices=["model", "random"])
+    parser.add_argument("--mac_random_seed", default=12345, type=int)
+    parser.add_argument("--mac_normalize_weights", action="store_true", default=False)
+    parser.add_argument("--mac_score", default="h0", choices=["h0", "h1", "mix"],
+                        help="[MAC] Coupling score. h0: original MAC (instantaneous velocity at both "
+                             "endpoints). h1: one-step average velocity u(e, r=0, t=1), i.e. distance "
+                             "between the 1-NFE sample from e and x. mix: rank average of h0 and h1.")
 
-def mac_inactive_before(args, step):
-    """step より前に MAC が一度も有効になっていない設定か (分岐の可否判定)。"""
-    if not args.mac or args.mac_weight == 0:
-        return True
-    start, end = mac_bounds(args)
-    return end <= start or start >= step
+    # ------------------------------------------------------------------
+    # [iMF] Single-GPU / Colab runner (iteration based; the DDP path above is epoch based)
+    # ------------------------------------------------------------------
+    parser.add_argument("--model_channels", default=128, type=int, help="U-Net base width.")
+    parser.add_argument("--total_iters", default=30_000, type=int)
+    parser.add_argument("--warmup_iters", default=1_000, type=int)
+    parser.add_argument("--grad_accum", default=1, type=int)
+    parser.add_argument("--log_every", default=100, type=int)
+    parser.add_argument("--sample_every", default=1_000, type=int)
+    parser.add_argument("--ckpt_every", default=2_000, type=int)
+    parser.add_argument("--eval_every", default=10_000, type=int)
+    parser.add_argument("--ckpt_dir", default="./ckpt", type=str)
+    parser.add_argument("--eval_seed", default=42, type=int)
+    parser.add_argument("--eval_steps", nargs="+", type=int, default=[1, 2, 4])
+    parser.add_argument("--eval_batch_size", default=250, type=int)
+    parser.add_argument("--resume_training", action="store_true", default=False,
+                        help="Explicitly resume a matching checkpoint in the Colab Runner.")
+    parser.add_argument("--deterministic", action="store_true", default=False)
+    parser.add_argument("--snapshot_steps", nargs="*", type=int, default=[],
+                        help="Also keep step_<N>.pt at these steps (e.g. 15000 = branch point for late MAC).")
+    parser.add_argument("--init_from", default="", type=str,
+                        help="Start from another run's step_<N>.pt (shared first half, MAC settings may differ).")
 
-
-def check_branch_config(parent_args, parent_config, current_args, current_config, step):
-    """
-    前半を共有して後半だけ分岐させる (init_from) ための検査。
-      1. MAC 以外の設定 (seed, 学習率, モデル, 総ステップ数, ソースコード) が完全に一致すること
-      2. 親 run も新しい run も、分岐点 step より前に MAC が有効でないこと
-    この 2 つを満たせば、分岐 run は「最初から通しで学習した run」と同じ計算になる。
-    """
-    if parent_config is None:
-        raise ValueError("Parent checkpoint has no experiment_config.")
-    differences = [key for key in sorted(set(parent_config) | set(current_config))
-                   if key not in MAC_KEYS and parent_config.get(key) != current_config.get(key)]
-    if differences:
-        raise ValueError("Cannot branch: non-MAC settings differ from the parent run: "
-                         + ", ".join(differences))
-    if not mac_inactive_before(parent_args, step):
-        raise ValueError(f"Cannot branch: the parent run already used MAC before step {step}.")
-    if not mac_inactive_before(current_args, step):
-        raise ValueError(f"Cannot branch at step {step}: this run's MAC window starts earlier "
-                         f"({mac_bounds(current_args)}).")
+    return parser
