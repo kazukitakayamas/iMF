@@ -24,7 +24,7 @@ import torch.nn as nn
 
 from models.ema import init_ema, update_ema_net
 from models.time_sampler import sample_two_timesteps
-from models.mac import endpoint_error, mac_weights, dup, apply_mac_losses
+from models.mac import endpoint_error, pair_score, mac_weights, dup, apply_mac_losses
 
 
 
@@ -165,12 +165,21 @@ class iMF(nn.Module):
             scorer.eval()
             # 採点時の条件: ガイダンスなし (omega=1)。class は学習時に net が見るものと同じにする
             # (use_cfg なら本物のラベル、そうでなければ null class)。
-            y_score = dup(y if self.args.use_cfg else y_in)   # 採点は 2B バッチで 1 回 forward
+            y_one = y if self.args.use_cfg else y_in
+            y_score = dup(y_one)   # h0 の採点は 2B バッチで 1 回 forward
             aug_score = dup(aug_cond)
-            err = endpoint_error(
-                lambda z_, t_: self.v_fn(scorer, z_, t_, torch.ones_like(t_), y_score, aug_score),
-                x, e,
-            )
+
+            def v_score(z_, t_):   # h0: 瞬時速度 v(z, t)  (元の MAC と同じ)
+                return self.v_fn(scorer, z_, t_, torch.ones_like(t_), y_score, aug_score)
+
+            def u1_score(e_):      # h1: 平均速度 u(e, r=0, t=1)  (1-NFE で使う量)
+                one = torch.ones(e_.shape[0], 1, 1, 1, device=e_.device, dtype=e_.dtype)
+                return self.u_fn(scorer, e_, one, torch.zeros_like(one), one,
+                                 torch.zeros_like(one), one, y_one, aug_cond)[0]
+
+            # [MAC-score] "h0" = 元の MAC (既定)。"h1" / "mix" = MeanFlow の 1-NFE 向け採点
+            err, score_stats = pair_score(getattr(self.args, "mac_score", "h0"),
+                                          v_score, u1_score, x, e)
             scorer.train(was_training)
             if self.mac_generator is None:
                 self.mac_generator = torch.Generator(device).manual_seed(
@@ -186,6 +195,7 @@ class iMF(nn.Module):
                 "mac_err_sel": float(err[mac_mask].mean()) if mac_mask.any() else 0.0,
                 "mac_frac": float(mac_mask.float().mean()),
                 "mac_weight_mean": float(mac_w.mean()),
+                **score_stats,   # mac_err_h0 / mac_err_h1 (計算した方だけ)
             }
 
       
