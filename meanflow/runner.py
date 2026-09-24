@@ -1,154 +1,427 @@
-"""MAC experiment definitions. No tensor dependency: usable before model creation."""
+"""
+単一 GPU (Colab) 用のランナー。
 
-import hashlib
-import json
+上流の train.py / training/ は torchrun + DDP + torch.compile 前提なので、
+それらには一切触らずに、単一 GPU 用の学習ループ・FID 評価・wandb ログをここにまとめている。
+ノートブックは args を組み立ててこのクラスを呼ぶだけのスイッチになる。
+
+MF と iMF の両方を同じループで回せるので、同一条件でのベースライン比較ができる。
+"""
+
 import math
-from pathlib import Path
+import os
+import time
+import functools
+import json
+
+import torch
+import torchvision
+from torch.utils.data import DataLoader
+from torchvision.utils import make_grid
+
+from models.augment import AugmentPipe
+from models.model_configs import instantiate_model
+from types import SimpleNamespace
+
+from mac_experiment import (validate_mac_args, scheduled_mac_percentile, mac_bounds,
+                            training_config, check_resume_config, check_branch_config)
+from training.data_transform import get_transform_cifar
+
+try:
+    import wandb
+except ImportError:  # wandb 無しでも動く
+    wandb = None
 
 
-WINDOWS = {
-    "none": (0.0, 0.0),
-    "all": (0.0, 1.0),
-    "early": (0.0, 0.5),
-    "middle": (0.25, 0.75),
-    "late": (0.5, 1.0),
-}
+def _log(metrics, step):
+    if wandb is not None and wandb.run is not None:
+        wandb.log(metrics, step=step)
 
 
-def mac_bounds(args):
-    """Return a zero-based, half-open [start, end) interval in optimizer steps."""
-    timing = getattr(args, "mac_timing", "all")
-    if timing == "custom":
-        lo, hi = args.mac_start_fraction, args.mac_end_fraction
-    elif timing in WINDOWS:
-        lo, hi = WINDOWS[timing]
-    else:
-        raise ValueError(f"Unknown mac_timing: {timing}")
-    if not (math.isfinite(lo) and math.isfinite(hi) and 0 <= lo <= hi <= 1):
-        raise ValueError("MAC fractions must satisfy 0 <= start <= end <= 1.")
-    if timing != "none" and lo == hi:
-        raise ValueError("MAC interval must have a positive length.")
-    return int(args.total_iters * lo), int(args.total_iters * hi)
+def _isolated_rng(fn):
+    """Evaluation must not advance the training RNG, including first FID initialization."""
+    @functools.wraps(fn)
+    def wrapped(self, *args, **kwargs):
+        devices = ([self.device.index if self.device.index is not None else torch.cuda.current_device()]
+                   if self.device.type == "cuda" else [])
+        with torch.random.fork_rng(devices=devices):
+            return fn(self, *args, **kwargs)
+    return wrapped
 
 
-def validate_mac_args(args):
-    if args.total_iters <= 0 or args.grad_accum <= 0 or args.batch_size <= 0:
-        raise ValueError("total_iters, grad_accum and batch_size must be positive.")
-    start, end = mac_bounds(args)
-    if getattr(args, "mac_target", "both") not in ("both", "main", "aux"):
-        raise ValueError("mac_target must be both, main or aux.")
-    if getattr(args, "mac_selection", "model") not in ("model", "random"):
-        raise ValueError("mac_selection must be model or random.")
-    if getattr(args, "mac_score", "h0") not in ("h0", "h1", "mix"):
-        raise ValueError("mac_score must be h0 (original MAC), h1 or mix.")
-    if not 0 < args.mac_percent <= 1 or not math.isfinite(args.mac_percent):
-        raise ValueError("mac_percent must be in (0, 1].")
-    if not math.isfinite(args.mac_weight) or args.mac_weight < 0:
-        raise ValueError("mac_weight must be finite and non-negative.")
-    if args.mac_warmup_iters < 0:
-        raise ValueError("mac_warmup_iters must be non-negative.")
-    enabled = args.mac and getattr(args, "mac_timing", "all") != "none"
-    if enabled:
-        if end <= start or int(args.batch_size * args.mac_percent) == 0:
-            raise ValueError("MAC must select at least one step and one sample.")
-        if getattr(args, "mac_timing", "all") != "all" and args.mac_warmup_iters != 0:
-            raise ValueError("Timing comparisons require mac_warmup_iters=0 (fixed selection fraction).")
-        if getattr(args, "mac_target", "both") == "aux" and not args.v_head:
-            raise ValueError("mac_target=aux requires v_head=True.")
-        if args.method != "imf" and (
-            getattr(args, "mac_target", "both") == "aux"
-            or getattr(args, "mac_selection", "model") != "model"
-            or getattr(args, "mac_normalize_weights", False)
-        ):
-            raise ValueError("Auxiliary/random/normalized MAC experiments require method=imf.")
+class TrainingBatchSampler:
+    """Infinite epoch-shuffled batches, addressable by consumed microbatch count.
 
-
-def scheduled_mac_percentile(args, step):
-    """None disables both scoring and weighting outside the selected window."""
-    start, end = mac_bounds(args)
-    if not args.mac or args.mac_weight == 0 or not start <= step < end:
-        return None
-    warmup = args.mac_warmup_iters
-    if warmup <= 0 or step >= warmup:
-        return args.mac_percent
-    return 1.0 - step * (1.0 - args.mac_percent) / warmup
-
-
-CONFIG_KEYS = (
-    "method", "arch", "dataset", "model_channels", "batch_size", "grad_accum",
-    "total_iters", "lr", "warmup_iters", "optimizer_betas", "dropout",
-    "ema_decay", "ema_decays", "seed", "use_edm_aug", "ratio", "tr_sampler",
-    "P_mean_t", "P_std_t", "P_mean_r", "P_std_r", "norm_p", "norm_eps",
-    "v_head", "use_cfg", "use_cfg_interval", "num_classes", "class_dropout_prob",
-    "cfg_s_max", "mac", "mac_timing", "mac_start_fraction", "mac_end_fraction",
-    "mac_target", "mac_selection", "mac_percent", "mac_weight", "mac_warmup_iters",
-    "mac_scorer", "mac_random_seed", "mac_normalize_weights", "deterministic",
-    "mac_score",
-)
-
-# 分岐 (init_from) のとき、元の run と違っていてよいキー = MAC の設定だけ。
-MAC_KEYS = tuple(key for key in CONFIG_KEYS if key.startswith("mac"))
-
-
-def training_config(args):
-    config = {key: getattr(args, key, None) for key in CONFIG_KEYS}
-    # Include the implementation itself so a modified model cannot silently resume.
-    root = Path(__file__).resolve().parent
-    digest = hashlib.sha256()
-    for path in sorted(list((root / "models").glob("*.py")) +
-                       [root / "runner.py", root / "mac_experiment.py",
-                        root / "training/data_transform.py"]):
-        digest.update(path.relative_to(root).as_posix().encode())
-        digest.update(path.read_bytes())
-    config["source_sha256"] = digest.hexdigest()
-    config["experiment_version"] = 1
-    return config
-
-
-def experiment_id(args, preset="run"):
-    config = training_config(args)
-    digest = hashlib.sha256(json.dumps(config, sort_keys=True).encode()).hexdigest()[:12]
-    timing = args.mac_timing if args.mac else "none"
-    score = getattr(args, "mac_score", "h0")
-    score_tag = "" if score == "h0" or not args.mac else f"-{score}"   # h0 (元の MAC) は従来どおりの名前
-    return (f"{args.method}-{preset}-{timing}-{args.mac_target}-{args.mac_selection}{score_tag}"
-            f"-seed{args.seed}-{digest}")
-
-
-def check_resume_config(saved, current):
-    if saved is None:
-        raise ValueError("Legacy checkpoint has no experiment_config. Use a new ckpt_dir.")
-    differences = [key for key in sorted(set(saved) | set(current))
-                   if saved.get(key) != current.get(key)]
-    if differences:
-        raise ValueError("Checkpoint configuration mismatch: " + ", ".join(differences)
-                         + ". Use a new experiment/checkpoint directory.")
-
-
-def mac_inactive_before(args, step):
-    """step より前に MAC が一度も有効になっていない設定か (分岐の可否判定)。"""
-    if not args.mac or args.mac_weight == 0:
-        return True
-    start, end = mac_bounds(args)
-    return end <= start or start >= step
-
-
-def check_branch_config(parent_args, parent_config, current_args, current_config, step):
+    Prefetch does not change restart position. Random image flips happen in the
+    training process, not in workers, so their RNG can also be checkpointed.
     """
-    前半を共有して後半だけ分岐させる (init_from) ための検査。
-      1. MAC 以外の設定 (seed, 学習率, モデル, 総ステップ数, ソースコード) が完全に一致すること
-      2. 親 run も新しい run も、分岐点 step より前に MAC が有効でないこと
-    この 2 つを満たせば、分岐 run は「最初から通しで学習した run」と同じ計算になる。
-    """
-    if parent_config is None:
-        raise ValueError("Parent checkpoint has no experiment_config.")
-    differences = [key for key in sorted(set(parent_config) | set(current_config))
-                   if key not in MAC_KEYS and parent_config.get(key) != current_config.get(key)]
-    if differences:
-        raise ValueError("Cannot branch: non-MAC settings differ from the parent run: "
-                         + ", ".join(differences))
-    if not mac_inactive_before(parent_args, step):
-        raise ValueError(f"Cannot branch: the parent run already used MAC before step {step}.")
-    if not mac_inactive_before(current_args, step):
-        raise ValueError(f"Cannot branch at step {step}: this run's MAC window starts earlier "
-                         f"({mac_bounds(current_args)}).")
+    def __init__(self, size, batch_size, seed, start_batch=0):
+        self.size, self.batch_size, self.seed = size, batch_size, seed
+        self.start_batch = start_batch
+        self.batches_per_epoch = size // batch_size
+        if self.batches_per_epoch == 0:
+            raise ValueError("Training dataset must contain at least one full batch.")
+
+    def __iter__(self):
+        epoch, offset = divmod(self.start_batch, self.batches_per_epoch)
+        while True:
+            g = torch.Generator().manual_seed(self.seed + epoch)
+            order = torch.randperm(self.size, generator=g).tolist()
+            for batch in range(offset, self.batches_per_epoch):
+                start = batch * self.batch_size
+                yield order[start:start + self.batch_size]
+            epoch, offset = epoch + 1, 0
+
+    def __len__(self):
+        return self.batches_per_epoch
+
+
+class Runner:
+    def __init__(self, args, device="cuda"):
+        self.args = args
+        self.device = torch.device(device)
+        validate_mac_args(args)
+        self.experiment_config = training_config(args)
+        torch.manual_seed(args.seed)
+        torch.use_deterministic_algorithms(getattr(args, "deterministic", False))
+        torch.backends.cudnn.benchmark = not getattr(args, "deterministic", False)
+        self.ckpt_path = os.path.join(args.ckpt_dir, "last.pt")
+        self.start_step = 0
+        self.branched = False
+        ck = None
+        if os.path.exists(self.ckpt_path):
+            if not getattr(args, "resume_training", False):
+                raise FileExistsError("Checkpoint exists. Set resume_training=True to resume, "
+                                      "or use a new experiment directory.")
+            ck = torch.load(self.ckpt_path, map_location="cpu", weights_only=True)
+            check_resume_config(ck.get("experiment_config"), self.experiment_config)
+            self.start_step = int(ck["step"])
+            if not 0 <= self.start_step <= args.total_iters:
+                raise ValueError("Checkpoint step is outside the training schedule.")
+        elif getattr(args, "resume_training", False):
+            raise FileNotFoundError(f"No checkpoint to resume: {self.ckpt_path}")
+        elif getattr(args, "init_from", ""):
+            # [分岐] 別 run の step_<N>.pt から開始する。前半 (MAC 無効区間) を共有し、
+            # 後半の MAC 設定 (timing / score / selection) だけを変える。
+            ck = torch.load(args.init_from, map_location="cpu", weights_only=True)
+            self.start_step = int(ck["step"])
+            check_branch_config(SimpleNamespace(**ck["args"]), ck.get("experiment_config"),
+                                args, self.experiment_config, self.start_step)
+            self.branched = True
+
+        # ---- data ----
+        self.train_set = torchvision.datasets.CIFAR10(
+            args.data_path, train=True, download=True, transform=get_transform_cifar(True)
+        )
+        self.fid_set = torchvision.datasets.CIFAR10(
+            args.data_path, train=True, download=True, transform=get_transform_cifar(True)
+        )
+        workers = getattr(args, "num_workers", 2)
+        self.train_loader = DataLoader(
+            self.train_set,
+            batch_sampler=TrainingBatchSampler(len(self.train_set), args.batch_size, args.seed,
+                                               self.start_step * args.grad_accum),
+            num_workers=workers, pin_memory=self.device.type == "cuda",
+            persistent_workers=workers > 0,
+            generator=torch.Generator().manual_seed(args.seed + 100000),
+        )
+        self.fid_loader = DataLoader(
+            self.fid_set, batch_size=500, shuffle=False, num_workers=workers,
+            generator=torch.Generator().manual_seed(getattr(args, "eval_seed", 42)),
+        )
+
+        # ---- model ----
+        self.model = instantiate_model(args).to(self.device)
+        self.is_imf = getattr(args, "method", "mf") == "imf"
+        if self.is_imf:
+            self.model.mac_generator = torch.Generator(self.device).manual_seed(
+                getattr(args, "mac_random_seed", 12345))
+        n_params = sum(p.numel() for p in self.model.net.parameters())
+        print(f"method={args.method} | arch params: {n_params / 1e6:.2f} M")
+
+        self.opt = torch.optim.Adam(
+            self.model.net.parameters(), lr=args.lr, betas=tuple(args.optimizer_betas)
+        )
+        self.augment_pipe = (
+            AugmentPipe(p=0.12, xflip=1e8, yflip=0, scale=1, rotate_frac=0, aniso=1, translate_frac=1)
+            if args.use_edm_aug else None
+        )
+
+        # ---- checkpoint ----
+        os.makedirs(args.ckpt_dir, exist_ok=True)
+        if ck is not None:
+            self.model.load_state_dict(ck["model"])
+            self.opt.load_state_dict(ck["opt"])
+            torch.set_rng_state(ck["rng_cpu"])
+            if self.device.type == "cuda" and ck.get("rng_cuda") is not None:
+                torch.cuda.set_rng_state(ck["rng_cuda"], self.device)
+            # 分岐時は MAC 用乱数を親から引き継がない (この run の mac_random_seed で初期化したまま)。
+            # 親では MAC が未使用なので、こうすると「最初から通しで学習した run」と一致する。
+            if self.is_imf and ck.get("mac_rng") is not None and not self.branched:
+                self.model.mac_generator.set_state(ck["mac_rng"])
+            if self.branched:
+                print(f"branched from {args.init_from} at step {self.start_step}")
+            else:
+                print(f"resumed from step {self.start_step}")
+        self.train_iter = iter(self.train_loader)
+        with open(os.path.join(args.ckpt_dir, "config.json"), "w") as f:
+            json.dump({"args": vars(args), "experiment_config": self.experiment_config},
+                      f, indent=2, ensure_ascii=False)
+
+        # ---- fixed noise for sample grids ----
+        g = torch.Generator(self.device).manual_seed(1234)
+        self.fixed_noise = torch.randn(64, 3, 32, 32, device=self.device, generator=g)
+        self.fixed_labels = (
+            torch.arange(64, device=self.device) % args.num_classes
+            if args.num_classes > 0 else torch.zeros(64, dtype=torch.long, device=self.device)
+        )
+        self._fid = None
+
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _infinite(loader):
+        while True:
+            for batch in loader:
+                yield batch
+
+    def _lr_at(self, step):
+        return self.args.lr * min(1.0, (step + 1) / max(1, self.args.warmup_iters))
+
+    def save(self, step, path=None):
+        path = self.ckpt_path if path is None else path
+        state = {"model": self.model.state_dict(), "opt": self.opt.state_dict(),
+                 "step": step, "args": vars(self.args),
+                 "experiment_config": self.experiment_config,
+                 "rng_cpu": torch.get_rng_state(),
+                 "rng_cuda": torch.cuda.get_rng_state(self.device) if self.device.type == "cuda" else None,
+                 "mac_rng": self.model.mac_generator.get_state() if self.is_imf else None}
+        temporary = path + ".tmp"
+        torch.save(state, temporary)
+        os.replace(temporary, path)
+
+    # ------------------------------------------------------------------
+    # 生成 / 可視化
+    # ------------------------------------------------------------------
+    @torch.no_grad()
+    def sample(self, n, num_steps=1, omega=1.0, t_min=0.0, t_max=1.0, labels=None,
+               net=None, generator=None):
+        net = net if net is not None else self.model.net_ema
+        net.eval()
+        shape = (n, 3, 32, 32)
+        if self.is_imf:
+            return self.model.sample(shape, net=net, device=self.device, num_steps=num_steps,
+                                     omega=omega, t_min=t_min, t_max=t_max,
+                                     labels=labels, generator=generator)
+        if num_steps != 1:
+            raise ValueError("The MF baseline in this Runner supports only num_steps=1.")
+        z = torch.randn(shape, device=self.device, generator=generator)
+        t = torch.ones(n, device=self.device)
+        return z - net(z, (t, t), aug_cond=None)
+
+    @staticmethod
+    def to_image(z):
+        """[-1,1] -> [0,1] の 8bit 量子化 (上流 eval_loop.py と同じ処理)"""
+        img = (z * 0.5 + 0.5).clamp(0.0, 1.0)
+        return torch.floor(img * 255.0) / 255.0
+
+    @torch.no_grad()
+    @_isolated_rng
+    def sample_grid(self, omega=1.0, nrow=8, save_path=None):
+        z = self.fixed_noise.clone()
+        if self.is_imf:
+            n = z.shape[0]
+            const = lambda v: torch.full((n, 1, 1, 1), float(v), device=self.device)
+            self.model.net_ema.eval()
+            u = self.model.u_fn(self.model.net_ema, z, const(1.0), const(0.0),
+                                const(omega), const(0.0), const(1.0), self.fixed_labels)[0]
+            z = z - u
+        else:
+            z = self.model.sample(z.shape, net=self.model.net_ema, device=self.device)
+        grid = make_grid(self.to_image(z), nrow=nrow)
+        if save_path:
+            torchvision.utils.save_image(self.to_image(z), save_path, nrow=nrow)
+        return grid
+
+    # ------------------------------------------------------------------
+    # FID (上流 eval_loop.py と同じく torchmetrics / CIFAR-10 train 50K が基準)
+    # ------------------------------------------------------------------
+    def _fid_metric(self):
+        if self._fid is None:
+            from torchmetrics.image.fid import FrechetInceptionDistance
+            self._fid = FrechetInceptionDistance(
+                feature=2048, normalize=True, reset_real_features=False
+            ).to(self.device)
+            with torch.no_grad():
+                for x, _ in self.fid_loader:
+                    self._fid.update(x.to(self.device, non_blocking=True), real=True)
+            print("real features:", int(self._fid.real_features_num_samples))
+        return self._fid
+
+    @torch.no_grad()
+    @_isolated_rng
+    def compute_fid(self, n_samples=None, num_steps=1, omega=1.0, t_min=0.0, t_max=1.0,
+                    bs=None, eval_seed=None):
+        n_samples = self.args.fid_samples if n_samples is None else n_samples
+        bs = getattr(self.args, "eval_batch_size", 250) if bs is None else bs
+        eval_seed = getattr(self.args, "eval_seed", 42) if eval_seed is None else eval_seed
+        if n_samples <= 0 or bs <= 0 or num_steps <= 0:
+            raise ValueError("n_samples, bs and num_steps must be positive.")
+        noise_generator = torch.Generator(self.device).manual_seed(eval_seed)
+        label_generator = torch.Generator(self.device).manual_seed(eval_seed + 1)
+        fid = self._fid_metric()
+        fid.reset()  # real 統計は保持される
+        remain = n_samples
+        while remain > 0:
+            b = min(bs, remain)
+            labels = None
+            if self.is_imf:
+                classes = self.args.num_classes
+                labels = (torch.randint(classes, (b,), device=self.device, generator=label_generator)
+                          if classes > 0 else torch.zeros(b, dtype=torch.long, device=self.device))
+            z = self.sample(b, num_steps=num_steps, omega=omega, t_min=t_min, t_max=t_max,
+                            labels=labels, generator=noise_generator)
+            fid.update(self.to_image(z).float(), real=False)
+            remain -= b
+        return float(fid.compute())
+
+    def evaluate_steps(self, steps=None, n_samples=None, omega=1.0):
+        if steps is None:
+            steps = getattr(self.args, "eval_steps", [1, 2, 4]) if self.is_imf else [1]
+        steps = list(steps)
+        results = {}
+        for nfe in steps:
+            value = self.compute_fid(n_samples=n_samples, num_steps=nfe, omega=omega)
+            results[str(nfe)] = value
+            print(f"{nfe}-NFE FID({n_samples or self.args.fid_samples}), "
+                  f"eval_seed={self.args.eval_seed}: {value:.4f}")
+        return results
+
+    def fid_sweep(self, omegas, n_samples=None, num_steps=1):
+        """柔軟な CFG の効果 (論文 Fig.4) を見るための omega スイープ"""
+        results = {}
+        for om in omegas:
+            results[om] = self.compute_fid(n_samples=n_samples, num_steps=num_steps, omega=om)
+            print(f"  omega={om}: FID = {results[om]:.3f}")
+        return results
+
+    # ------------------------------------------------------------------
+    # 学習
+    # ------------------------------------------------------------------
+    def train(self):
+        args = self.args
+        self.model.train()
+        
+        run = {key: 0.0 for key in ("loss", "loss_u", "loss_v", "loss_u_unweighted",
+                                    "loss_v_unweighted", "mac_err", "mac_err_sel",
+                                    "mac_frac", "mac_weight_mean", "mac_active",
+                                    "mac_err_h0", "mac_err_h1")}
+        log_count = 0
+        bounds = mac_bounds(args)
+        print(f"MAC {args.mac_timing}: zero-based steps {bounds}, "
+              f"target={args.mac_target}, selection={args.mac_selection}, "
+              f"score={getattr(args, 'mac_score', 'h0')}")
+        t0 = time.time()
+
+        for step in range(self.start_step, args.total_iters):
+            mac_p = scheduled_mac_percentile(args, step)
+            log_count += 1
+            run["mac_active"] += float(mac_p is not None)
+            for g in self.opt.param_groups:
+                g["lr"] = self._lr_at(step)
+
+            self.opt.zero_grad(set_to_none=True)
+            for _ in range(args.grad_accum):
+                x, y = next(self.train_iter)
+                x = x.to(self.device, non_blocking=True) * 2.0 - 1.0
+                y = y.to(self.device, non_blocking=True)
+                # Same p=0.5 flip as the original transform, with checkpointable training RNG.
+                flip = torch.rand((x.shape[0], 1, 1, 1), device=self.device) < 0.5
+                x = torch.where(flip, x.flip(-1), x)
+
+                aug_cond = None
+                if self.augment_pipe is not None:
+                    x, aug_cond = self.augment_pipe(x)
+
+                if self.is_imf:
+                    loss, parts = self.model.forward_with_loss(x, y, aug_cond, mac_percentile=mac_p)
+                else:
+                    loss, parts = self.model.forward_with_loss(x, aug_cond, mac_percentile=mac_p), {}
+
+                (loss / args.grad_accum).backward()
+                run["loss"] += float(loss.detach()) / args.grad_accum
+                run["loss_u"] += parts.get("loss_u", 0.0) / args.grad_accum
+                run["loss_v"] += parts.get("loss_v", 0.0) / args.grad_accum
+                run["mac_err"] += parts.get("mac_err", 0.0) / args.grad_accum
+                run["mac_err_sel"] += parts.get("mac_err_sel", 0.0) / args.grad_accum
+                for key in ("loss_u_unweighted", "loss_v_unweighted", "mac_frac", "mac_weight_mean",
+                            "mac_err_h0", "mac_err_h1"):
+                    run[key] += parts.get(key, 0.0) / args.grad_accum
+
+            self.opt.step()
+            self.model.update_ema()
+            self.start_step = step + 1
+
+            if not math.isfinite(run["loss"]):
+                raise ValueError(f"loss diverged at step {step}")
+
+            if (step + 1) % args.log_every == 0 or step + 1 == args.total_iters:
+                dt, n = time.time() - t0, log_count
+                metrics = {"train/loss": run["loss"] / n, "train/loss_u": run["loss_u"] / n,
+                           "train/loss_v": run["loss_v"] / n,
+                           "train/lr": self.opt.param_groups[0]["lr"],
+                           "perf/sec_per_iter": dt / n}
+                metrics.update({"train/loss_main_before_mac": run["loss_u_unweighted"] / n,
+                                "train/loss_aux_before_mac": run["loss_v_unweighted"] / n,
+                                "mac/active": float(mac_p is not None),
+                                "mac/active_fraction": run["mac_active"] / n,
+                                "mac/percentile": mac_p if mac_p is not None else 0.0})
+                active_count = run["mac_active"]
+                if active_count > 0 and self.is_imf:
+                    metrics.update({"mac/endpoint_err": run["mac_err"] / active_count,
+                                    "mac/endpoint_err_selected": run["mac_err_sel"] / active_count,
+                                    "mac/selected_fraction": run["mac_frac"] / active_count,
+                                    "mac/weight_mean": run["mac_weight_mean"] / active_count})
+                    for key in ("mac_err_h0", "mac_err_h1"):   # 計算した採点だけ記録
+                        if run[key] > 0:
+                            metrics[f"mac/{key[4:]}"] = run[key] / active_count
+                _log(metrics, step + 1)
+                with open(os.path.join(args.ckpt_dir, "metrics.jsonl"), "a") as f:
+                    f.write(json.dumps({"step": step + 1, **metrics}) + "\n")
+                print(f"step {step+1:>7} | loss {run['loss']/n:.4f} "
+                      f"(u {run['loss_u']/n:.3f} / v {run['loss_v']/n:.3f}) "
+                      f"| MAC {int(mac_p is not None)} | lr {self.opt.param_groups[0]['lr']:.2e} | {dt/n:.3f} s/it")
+                run = {k: 0.0 for k in run}
+                log_count = 0
+                t0 = time.time()
+
+            if (step + 1) % args.sample_every == 0:
+                if wandb is not None and wandb.run is not None:
+                    imgs = {"samples/1nfe_ema": wandb.Image(self.sample_grid(omega=1.0))}
+                    if self.is_imf and args.use_cfg:
+                        imgs["samples/1nfe_ema_w2"] = wandb.Image(self.sample_grid(omega=2.0))
+                    _log(imgs, step + 1)
+                self.model.train()
+                t0 = time.time()
+
+            if (step + 1) % args.ckpt_every == 0:
+                self.save(step + 1)
+                t0 = time.time()
+
+            if (step + 1) in getattr(args, "snapshot_steps", []):
+                # 分岐点のスナップショット (last.pt と違って上書きされない)
+                self.save(step + 1, os.path.join(args.ckpt_dir, f"step_{step + 1}.pt"))
+                print(f"snapshot saved: step_{step + 1}.pt")
+                t0 = time.time()
+
+            if (step + 1) % args.eval_every == 0:
+                scores = self.evaluate_steps()
+                _log({f"eval/fid_{nfe}nfe": value for nfe, value in scores.items()}, step + 1)
+                with open(os.path.join(args.ckpt_dir, "evaluations.jsonl"), "a") as f:
+                    f.write(json.dumps({"step": step + 1, "fid": scores,
+                                        "n_samples": args.fid_samples, "eval_seed": args.eval_seed,
+                                        "eval_batch_size": args.eval_batch_size}) + "\n")
+                self.model.train()
+                t0 = time.time()
+
+        self.save(args.total_iters)
+        print("done")
