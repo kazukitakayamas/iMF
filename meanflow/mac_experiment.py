@@ -39,6 +39,8 @@ def validate_mac_args(args):
         raise ValueError("mac_target must be both, main or aux.")
     if getattr(args, "mac_selection", "model") not in ("model", "random"):
         raise ValueError("mac_selection must be model or random.")
+    if getattr(args, "mac_score", "h0") not in ("h0", "h1", "mix"):
+        raise ValueError("mac_score must be h0 (original MAC), h1 or mix.")
     if not 0 < args.mac_percent <= 1 or not math.isfinite(args.mac_percent):
         raise ValueError("mac_percent must be in (0, 1].")
     if not math.isfinite(args.mac_weight) or args.mac_weight < 0:
@@ -81,7 +83,11 @@ CONFIG_KEYS = (
     "cfg_s_max", "mac", "mac_timing", "mac_start_fraction", "mac_end_fraction",
     "mac_target", "mac_selection", "mac_percent", "mac_weight", "mac_warmup_iters",
     "mac_scorer", "mac_random_seed", "mac_normalize_weights", "deterministic",
+    "mac_score",
 )
+
+# 分岐 (init_from) のとき、元の run と違っていてよいキー = MAC の設定だけ。
+MAC_KEYS = tuple(key for key in CONFIG_KEYS if key.startswith("mac"))
 
 
 def training_config(args):
@@ -103,7 +109,10 @@ def experiment_id(args, preset="run"):
     config = training_config(args)
     digest = hashlib.sha256(json.dumps(config, sort_keys=True).encode()).hexdigest()[:12]
     timing = args.mac_timing if args.mac else "none"
-    return f"{args.method}-{preset}-{timing}-{args.mac_target}-{args.mac_selection}-seed{args.seed}-{digest}"
+    score = getattr(args, "mac_score", "h0")
+    score_tag = "" if score == "h0" or not args.mac else f"-{score}"   # h0 (元の MAC) は従来どおりの名前
+    return (f"{args.method}-{preset}-{timing}-{args.mac_target}-{args.mac_selection}{score_tag}"
+            f"-seed{args.seed}-{digest}")
 
 
 def check_resume_config(saved, current):
@@ -114,3 +123,32 @@ def check_resume_config(saved, current):
     if differences:
         raise ValueError("Checkpoint configuration mismatch: " + ", ".join(differences)
                          + ". Use a new experiment/checkpoint directory.")
+
+
+def mac_inactive_before(args, step):
+    """step より前に MAC が一度も有効になっていない設定か (分岐の可否判定)。"""
+    if not args.mac or args.mac_weight == 0:
+        return True
+    start, end = mac_bounds(args)
+    return end <= start or start >= step
+
+
+def check_branch_config(parent_args, parent_config, current_args, current_config, step):
+    """
+    前半を共有して後半だけ分岐させる (init_from) ための検査。
+      1. MAC 以外の設定 (seed, 学習率, モデル, 総ステップ数, ソースコード) が完全に一致すること
+      2. 親 run も新しい run も、分岐点 step より前に MAC が有効でないこと
+    この 2 つを満たせば、分岐 run は「最初から通しで学習した run」と同じ計算になる。
+    """
+    if parent_config is None:
+        raise ValueError("Parent checkpoint has no experiment_config.")
+    differences = [key for key in sorted(set(parent_config) | set(current_config))
+                   if key not in MAC_KEYS and parent_config.get(key) != current_config.get(key)]
+    if differences:
+        raise ValueError("Cannot branch: non-MAC settings differ from the parent run: "
+                         + ", ".join(differences))
+    if not mac_inactive_before(parent_args, step):
+        raise ValueError(f"Cannot branch: the parent run already used MAC before step {step}.")
+    if not mac_inactive_before(current_args, step):
+        raise ValueError(f"Cannot branch at step {step}: this run's MAC window starts earlier "
+                         f"({mac_bounds(current_args)}).")
